@@ -1,137 +1,119 @@
 import sqlite3
 import os
 import datetime
+import json
+import getpass
+from google import genai
 
-# Definir la ruta relativa a la base de datos local
+# Ruta relativa a la base de datos local
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'database', 'inventario.db')
 
-class AgenteAtencion:
-    """Agente 1: Interpreta la solicitud inicial del usuario."""
+print("\n" + "*"*60)
+print(" INICIANDO SISTEMA EXPERTO MULTIAGENTE (LOCAL) ")
+print("*"*60)
+
+api_key_segura = getpass.getpass("Ingresa tu API Key de Gemini y presiona Enter: ")
+client = genai.Client(api_key=api_key_segura)
+
+class AgenteAtencionIA:
+    """Agente 1: Usa IA Generativa para interpretar el mensaje natural."""
     def procesar_solicitud(self, mensaje):
-        print(f"\n🤖 [Agente 1 - Atención]: Analizando mensaje: '{mensaje}'")
+        print(f"\n[Agente 1 - Atención IA]: Analizando intención del usuario...")
         
-        # Simulación de extracción de entidades. 
-        # NOTA: Para una prueba dinámica en terminal, buscaremos palabras clave básicas.
-        mensaje_lower = mensaje.lower()
-        componente = None
-        cantidad = 1 # Por defecto
+        prompt_sistema = f"""
+        Eres un agente experto en ventas de componentes electrónicos.
+        Extrae el nombre del componente y la cantidad solicitada del siguiente mensaje: "{mensaje}"
         
-        if "nema17" in mensaje_lower:
-            componente = "Motor NEMA17"
-            cantidad = 3 # Simulando que extrajo el número
-        elif "esp32" in mensaje_lower:
-            componente = "ESP32"
-            cantidad = 2
-        elif "capacitor" in mensaje_lower:
-            componente = "Capacitor 100uF"
-            cantidad = 10
-            
-        if componente:
-            datos = {"componente": componente, "cantidad": cantidad}
-            print(f"✅ [Agente 1 - Atención]: Intención extraída -> {datos}\n")
-            return datos
-        else:
-            print("⚠️ [Agente 1 - Atención]: No pude identificar el componente solicitado.\n")
+        Reglas estrictas:
+        1. Responde ÚNICAMENTE con un formato JSON válido.
+        2. Las claves del JSON deben ser: "componente" y "cantidad".
+        3. Si no se especifica cantidad, asume que es 1.
+        4. Normaliza el nombre del componente (ej. "Motor NEMA17", "ESP32", "Capacitor 100uF", "Driver A4988").
+        """
+        try:
+            respuesta = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt_sistema
+            )
+            texto_limpio = respuesta.text.strip().replace('```json', '').replace('```', '')
+            datos_extraidos = json.loads(texto_limpio)
+            print(f"[Agente 1]: Intención extraída -> {datos_extraidos}")
+            return datos_extraidos
+        except Exception as e:
+            print(f"[Agente 1]: Error de IA: {e}")
             return None
 
 class AgenteGenerador:
-    """Agente 2: Aplica reglas de negocio, infiere y registra la orden."""
+    """Agente 2: Aplica reglas de negocio e interactúa con SQLite."""
     def evaluar_y_procesar(self, datos_solicitud):
-        print("⚙️ [Agente 2 - Generador]: Evaluando inventario y reglas de negocio...")
-        
+        print("[Agente 2 - Generador]: Evaluando inventario y reglas...")
         conexion = sqlite3.connect(DB_PATH)
         cursor = conexion.cursor()
         
-        componente = datos_solicitud["componente"]
-        cantidad_solicitada = datos_solicitud["cantidad"]
+        componente = datos_solicitud.get("componente")
+        cantidad_solicitada = datos_solicitud.get("cantidad", 1)
         
-        # Consultar stock actual
-        cursor.execute("SELECT id, stock, estado_ciclo, precio_unitario FROM componentes WHERE nombre = ?", (componente,))
+        cursor.execute("SELECT id, stock, estado_ciclo, precio_unitario FROM componentes WHERE nombre LIKE ?", (f"%{componente}%",))
         resultado = cursor.fetchone()
         
         if not resultado:
             conexion.close()
-            return {"estado": "error", "razon": "Componente no encontrado en el catálogo."}
+            return {"estado": "error", "razon": f"Componente '{componente}' no encontrado en el catálogo."}
             
         id_comp, stock, estado_ciclo, precio = resultado
         
-        # --- REGLAS DE INFERENCIA LÓGICA ---
         if stock < cantidad_solicitada:
             conexion.close()
             return {"estado": "rechazado", "razon": f"Stock insuficiente ({stock} disponibles). Sugerir reabastecimiento.", "stock_actual": stock}
             
-        if estado_ciclo == "Descontinuado":
-            conexion.close()
-            return {"estado": "advertencia", "razon": "Componente descontinuado. No apto para nuevos diseños."}
-            
-        # --- PROCESAR ORDEN (Si aprueba las reglas) ---
         total = cantidad_solicitada * precio
         fecha_actual = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         try:
-            # 1. Registrar el pedido
-            cursor.execute("INSERT INTO pedidos (fecha, descuento_aplicado, estado_orden) VALUES (?, ?, ?)", (fecha_actual, 0.0, "Completado"))
+            cursor.execute("INSERT INTO pedidos (fecha, estado_orden) VALUES (?, ?)", (fecha_actual, "Completado"))
             id_pedido = cursor.lastrowid
-            
-            # 2. Registrar el detalle
             cursor.execute("INSERT INTO detalle_pedidos (id_pedido, id_componente, cantidad) VALUES (?, ?, ?)", (id_pedido, id_comp, cantidad_solicitada))
-            
-            # 3. Actualizar el stock (Restar)
             nuevo_stock = stock - cantidad_solicitada
             cursor.execute("UPDATE componentes SET stock = ? WHERE id = ?", (nuevo_stock, id_comp))
-            
             conexion.commit()
-            print(f"✅ [Agente 2 - Generador]: Pedido #{id_pedido} registrado. Stock actualizado ({nuevo_stock} restantes).\n")
             resultado_final = {"estado": "aprobado", "total": total, "stock_actual": nuevo_stock, "precio": precio, "id_pedido": id_pedido}
-            
         except Exception as e:
             conexion.rollback()
             resultado_final = {"estado": "error", "razon": str(e)}
-            
         finally:
             conexion.close()
-            
         return resultado_final
 
 class AgenteSupervisor:
-    """Agente 3: Explica las decisiones tomadas para cumplir con la rúbrica (20%)."""
+    """Agente 3: Explica la decisión final al usuario."""
     def explicar_decision(self, datos_solicitud, resultado_inferencia):
-        print("👁️ [Agente 3 - Supervisor]: Generando explicación de la decisión...")
-        
-        componente = datos_solicitud["componente"]
-        cantidad = datos_solicitud["cantidad"]
+        print("[Agente 3 - Supervisor]: Generando explicación...")
+        componente = datos_solicitud.get("componente")
+        cantidad = datos_solicitud.get("cantidad")
         
         if resultado_inferencia["estado"] == "aprobado":
-            explicacion = f"Se autorizó el pedido #{resultado_inferencia['id_pedido']} por {cantidad}x {componente}. Existe stock suficiente y la pieza es recomendada. El inventario se ha actualizado correctamente (quedan {resultado_inferencia['stock_actual']} unidades). Total: ${resultado_inferencia['total']}."
+            explicacion = f"Se autorizó el pedido #{resultado_inferencia['id_pedido']} por {cantidad}x {componente}. Existe stock suficiente. El inventario se ha actualizado (quedan {resultado_inferencia['stock_actual']}). Total: ${resultado_inferencia['total']}."
         else:
             explicacion = f"Se detuvo la venta de {cantidad}x {componente}. Razón: {resultado_inferencia['razon']}"
             
         print("\n" + "="*60)
-        print("📢 EXPLICACIÓN PARA EL CLIENTE/ADMIN:")
+        print("EXPLICACIÓN PARA EL CLIENTE/ADMIN:")
         print("="*60)
         print(explicacion)
-        print("="*60 + "\n")
+        print("="*60)
 
-# --- Bucle de Chat en Terminal ---
 if __name__ == "__main__":
-    agente_atencion = AgenteAtencion()
+    agente_atencion = AgenteAtencionIA()
     agente_generador = AgenteGenerador()
     agente_supervisor = AgenteSupervisor()
     
-    print("\n" + "*"*50)
-    print(" INICIANDO SISTEMA EXPERTO MULTIAGENTE (LOCAL) ")
-    print("*"*50)
-    print("Escribe 'salir' para terminar el programa.")
-    
     while True:
-        mensaje_cliente = input("\n👤 Cliente: ")
-        
+        mensaje_cliente = input("\nCliente (escribe 'salir' para terminar): ")
         if mensaje_cliente.lower() == 'salir':
-            print("Apagando sistema multiagente...")
+            print("Apagando sistema...")
             break
             
         datos_estructurados = agente_atencion.procesar_solicitud(mensaje_cliente)
-        
         if datos_estructurados:
             resultado = agente_generador.evaluar_y_procesar(datos_estructurados)
             agente_supervisor.explicar_decision(datos_estructurados, resultado)
